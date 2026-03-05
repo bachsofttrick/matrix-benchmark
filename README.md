@@ -1,6 +1,6 @@
 # Matrix Multiplication Benchmark
 
-Benchmarks five NxN (default 512×512) matrix multiplication methods:
+Benchmarks five NxN (default 8192×8192) matrix multiplication methods:
 
 | # | Method | Description |
 |---|--------|-------------|
@@ -58,7 +58,7 @@ The `matmul.spv` file must be in the same directory as the executable.
 ## Expected Output
 
 ```
-Matrix size: 512 x 512
+Matrix size: 8192 x 8192
 Threads (pthread): 8
 
 Naive:        XXXX ms
@@ -82,7 +82,7 @@ Vulkan:       XXXX ms  (upload + dispatch + download)
 
 Edit `test.cpp` line:
 ```cpp
-static const uint32_t N = 512;
+static const uint32_t N = 8192;
 ```
 Then recompile. Values must be divisible by 16 for the Vulkan shader's work-group
 size to divide evenly (the shader clamps out-of-bounds threads otherwise).
