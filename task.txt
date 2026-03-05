@@ -1,0 +1,10 @@
+Write me a C++ program that does the following:
+- function 1: Matrix Multiplication with normal for loop
+- function 2: Matrix Multiplication with some kind of vector acceleration on modern CPU
+- function 3: Matrix Multiplication using Vulkan
+- function 4: Matrix Multiplication with pthread
+- function 5: Matrix Multiplication with pthread and AVX2 in each core
+- Each will be timed
+- Print out the time measured for each function
+output to test.cpp
+print how to compile and run in README.md
