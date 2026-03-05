@@ -249,11 +249,12 @@ static uint32_t findMemType(VkPhysicalDevice pd, uint32_t bits, VkMemoryProperty
 }
 
 static void makeBuffer(VkDevice dev, VkPhysicalDevice pd, VkDeviceSize size,
+                       VkBufferUsageFlags usage, VkMemoryPropertyFlags memProps,
                        VkBuffer& buf, VkDeviceMemory& mem) {
     VkBufferCreateInfo bci{};
     bci.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bci.size        = size;
-    bci.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bci.usage       = usage;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (vkCreateBuffer(dev, &bci, nullptr, &buf) != VK_SUCCESS)
         throw std::runtime_error("vkCreateBuffer failed");
@@ -264,9 +265,7 @@ static void makeBuffer(VkDevice dev, VkPhysicalDevice pd, VkDeviceSize size,
     VkMemoryAllocateInfo ai{};
     ai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize  = mr.size;
-    ai.memoryTypeIndex = findMemType(pd, mr.memoryTypeBits,
-                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    ai.memoryTypeIndex = findMemType(pd, mr.memoryTypeBits, memProps);
     if (vkAllocateMemory(dev, &ai, nullptr, &mem) != VK_SUCCESS)
         throw std::runtime_error("vkAllocateMemory failed");
     vkBindBufferMemory(dev, buf, mem, 0);
@@ -315,11 +314,34 @@ public:
             throw std::runtime_error("vkCreateDevice failed");
         vkGetDeviceQueue(dev_, qf_, 0, &queue_);
 
-        // Buffers (A, B, C)
+        // Device-local buffers for compute (A, B: TRANSFER_DST | STORAGE; C: TRANSFER_SRC | STORAGE)
         VkDeviceSize sz = (VkDeviceSize)n_ * n_ * sizeof(float);
-        makeBuffer(dev_, pd_, sz, bufA_, memA_);
-        makeBuffer(dev_, pd_, sz, bufB_, memB_);
-        makeBuffer(dev_, pd_, sz, bufC_, memC_);
+        makeBuffer(dev_, pd_, sz,
+                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                   bufA_, memA_);
+        makeBuffer(dev_, pd_, sz,
+                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                   bufB_, memB_);
+        makeBuffer(dev_, pd_, sz,
+                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                   bufC_, memC_);
+
+        // Staging buffers (HOST_VISIBLE | HOST_COHERENT) for CPU upload/download
+        makeBuffer(dev_, pd_, sz,
+                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                   stagBufA_, stagMemA_);
+        makeBuffer(dev_, pd_, sz,
+                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                   stagBufB_, stagMemB_);
+        makeBuffer(dev_, pd_, sz,
+                   VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                   stagBufC_, stagMemC_);
 
         // Shader module
         auto spirv = loadSPIRV(spirvPath);
@@ -418,19 +440,20 @@ public:
         vkCreateFence(dev_, &fci, nullptr, &fence_);
     }
 
-    // Upload A and B, dispatch compute, download C.
+    // Upload A and B to staging, DMA to VRAM, dispatch compute, DMA result back, download C.
     // Only this function is timed in main().
     void compute(const float* A, const float* B, float* C) {
         VkDeviceSize sz = (VkDeviceSize)n_ * n_ * sizeof(float);
 
+        // Write A and B into host-visible staging buffers
         auto upload = [&](VkDeviceMemory mem, const float* src) {
             void* ptr;
             vkMapMemory(dev_, mem, 0, sz, 0, &ptr);
             memcpy(ptr, src, sz);
             vkUnmapMemory(dev_, mem);
         };
-        upload(memA_, A);
-        upload(memB_, B);
+        upload(stagMemA_, A);
+        upload(stagMemB_, B);
 
         // Record command buffer
         vkResetCommandBuffer(cmdBuf_, 0);
@@ -439,6 +462,22 @@ public:
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmdBuf_, &bi);
 
+        // DMA staging -> device-local for A and B
+        VkBufferCopy region{0, 0, sz};
+        vkCmdCopyBuffer(cmdBuf_, stagBufA_, bufA_, 1, &region);
+        vkCmdCopyBuffer(cmdBuf_, stagBufB_, bufB_, 1, &region);
+
+        // Barrier: transfer writes must be visible to the compute shader
+        VkMemoryBarrier bar{};
+        bar.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmdBuf_,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &bar, 0, nullptr, 0, nullptr);
+
+        // Dispatch compute
         vkCmdBindPipeline(cmdBuf_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         vkCmdBindDescriptorSets(cmdBuf_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 pipeLayout_, 0, 1, &descSet_, 0, nullptr);
@@ -446,6 +485,18 @@ public:
                            0, sizeof(uint32_t), &n_);
         uint32_t groups = (n_ + 15) / 16;
         vkCmdDispatch(cmdBuf_, groups, groups, 1);
+
+        // Barrier: shader writes to C must be visible to the transfer
+        bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        bar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmdBuf_,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &bar, 0, nullptr, 0, nullptr);
+
+        // DMA device-local C -> staging
+        vkCmdCopyBuffer(cmdBuf_, bufC_, stagBufC_, 1, &region);
+
         vkEndCommandBuffer(cmdBuf_);
 
         // Submit and wait
@@ -457,11 +508,11 @@ public:
         vkQueueSubmit(queue_, 1, &si, fence_);
         vkWaitForFences(dev_, 1, &fence_, VK_TRUE, UINT64_MAX);
 
-        // Download C
+        // Download C from staging
         void* ptr;
-        vkMapMemory(dev_, memC_, 0, sz, 0, &ptr);
+        vkMapMemory(dev_, stagMemC_, 0, sz, 0, &ptr);
         memcpy(C, ptr, sz);
-        vkUnmapMemory(dev_, memC_);
+        vkUnmapMemory(dev_, stagMemC_);
     }
 
     ~VulkanMatMul() {
@@ -472,6 +523,9 @@ public:
         vkDestroyPipelineLayout(dev_, pipeLayout_, nullptr);
         vkDestroyDescriptorSetLayout(dev_, dsl_, nullptr);
         vkDestroyShaderModule(dev_, shader_, nullptr);
+        vkDestroyBuffer(dev_, stagBufC_, nullptr); vkFreeMemory(dev_, stagMemC_, nullptr);
+        vkDestroyBuffer(dev_, stagBufB_, nullptr); vkFreeMemory(dev_, stagMemB_, nullptr);
+        vkDestroyBuffer(dev_, stagBufA_, nullptr); vkFreeMemory(dev_, stagMemA_, nullptr);
         vkDestroyBuffer(dev_, bufC_, nullptr); vkFreeMemory(dev_, memC_, nullptr);
         vkDestroyBuffer(dev_, bufB_, nullptr); vkFreeMemory(dev_, memB_, nullptr);
         vkDestroyBuffer(dev_, bufA_, nullptr); vkFreeMemory(dev_, memA_, nullptr);
@@ -492,6 +546,12 @@ private:
     VkDeviceMemory        memA_      = VK_NULL_HANDLE;
     VkDeviceMemory        memB_      = VK_NULL_HANDLE;
     VkDeviceMemory        memC_      = VK_NULL_HANDLE;
+    VkBuffer              stagBufA_  = VK_NULL_HANDLE;
+    VkBuffer              stagBufB_  = VK_NULL_HANDLE;
+    VkBuffer              stagBufC_  = VK_NULL_HANDLE;
+    VkDeviceMemory        stagMemA_  = VK_NULL_HANDLE;
+    VkDeviceMemory        stagMemB_  = VK_NULL_HANDLE;
+    VkDeviceMemory        stagMemC_  = VK_NULL_HANDLE;
     VkShaderModule        shader_    = VK_NULL_HANDLE;
     VkDescriptorSetLayout dsl_       = VK_NULL_HANDLE;
     VkPipelineLayout      pipeLayout_= VK_NULL_HANDLE;
