@@ -14,6 +14,7 @@
 #include <vulkan/vulkan.h>
 
 static const uint32_t N = 8192; // Matrix dimension NxN
+static const int deviceNo = 0; // Adjust if you have multiple GPUs, otherwise leave it at 0
 
 // ============================================================
 // Utility
@@ -291,7 +292,7 @@ public:
         if (!cnt) throw std::runtime_error("No Vulkan GPU found");
         std::vector<VkPhysicalDevice> pds(cnt);
         vkEnumeratePhysicalDevices(instance_, &cnt, pds.data());
-        pd_ = pds[0];
+        pd_ = pds[deviceNo];
 
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(pd_, &props);
@@ -584,7 +585,7 @@ int main() {
     // --- Function 1: Naive ---
     {
         auto t0 = std::chrono::high_resolution_clock::now();
-        //matmul_naive(A.data(), B.data(), C.data(), n);
+        matmul_naive(A.data(), B.data(), C.data(), n);
         auto t1 = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         std::cout << "Naive:  " << ms << " ms\n";
@@ -593,7 +594,7 @@ int main() {
     // --- Function 2: AVX2 ---
     {
         auto t0 = std::chrono::high_resolution_clock::now();
-        //matmul_avx2(A.data(), B.data(), C.data(), n);
+        matmul_avx2(A.data(), B.data(), C.data(), n);
         auto t1 = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         std::cout << "AVX2:   " << ms << " ms\n";
