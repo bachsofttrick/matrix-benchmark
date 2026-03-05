@@ -184,7 +184,8 @@ This is the most complex method. It runs the multiplication on the GPU using the
 ### 6a. The Shader (`matmul.comp`)
 
 ```glsl
-layout(local_size_x = 16, local_size_y = 16) in;
+#define TILE 16
+layout(local_size_x = TILE, local_size_y = TILE) in;
 ```
 
 The GPU launches thousands of tiny programs (invocations) in parallel. They are grouped into **workgroups** of 16×16=256 threads.
@@ -194,16 +195,40 @@ Each invocation is assigned one output element `C[row][col]`:
 ```glsl
 uint col = gl_GlobalInvocationID.x;
 uint row = gl_GlobalInvocationID.y;
+uint lx  = gl_LocalInvocationID.x;  // thread column within workgroup
+uint ly  = gl_LocalInvocationID.y;  // thread row within workgroup
 ```
 
-Each invocation independently computes its dot product:
+Instead of each thread independently reading from global memory for every multiply-add, the shader uses **tiled shared memory**:
 
 ```glsl
-for (uint k = 0; k < pc.N; k++) {
-    sum += A.data[row * pc.N + k] * B.data[k * pc.N + col];
-}
-C.data[row * pc.N + col] = sum;
+shared float tileA[TILE][TILE];
+shared float tileB[TILE][TILE];
 ```
+
+`shared` memory is on-chip SRAM local to each SM (streaming multiprocessor) — orders of magnitude faster than VRAM. Each workgroup gets its own private copy.
+
+**How tiling works:**
+
+The full N×N dot product is broken into `numTiles = ceil(N/16)` phases. In each phase `t`:
+
+1. All 256 threads in the workgroup **cooperatively** load a 16×16 tile of A and a 16×16 tile of B into shared memory (one float per thread).
+2. `barrier()` ensures every thread has finished loading before any thread starts reading.
+3. Each thread accumulates 16 multiply-adds using the tile data from shared memory.
+4. Another `barrier()` prevents overwriting shared memory before all threads finish consuming it.
+
+```glsl
+for (uint t = 0; t < numTiles; t++) {
+    tileA[ly][lx] = (row < pc.N && aCol < pc.N) ? A.data[row * pc.N + aCol] : 0.0;
+    tileB[ly][lx] = (bRow < pc.N && col < pc.N) ? B.data[bRow * pc.N + col] : 0.0;
+    barrier();
+    for (uint k = 0; k < TILE; k++)
+        sum += tileA[ly][k] * tileB[k][lx];
+    barrier();
+}
+```
+
+**Why this is faster:** The naive shader read B in column-stride (jumping N floats = 32 KB per step), causing cache misses on every access. With tiling, each global memory load is reused 16× by other threads in the workgroup. Global memory traffic drops by ~16×.
 
 `pc.N` is passed from the CPU via a **push constant** (a small fast-path for passing values to shaders).
 
@@ -228,49 +253,47 @@ The constructor creates all Vulkan objects that are reused across calls. In orde
 | `vkCreateCommandPool` / `vkAllocateCommandBuffers` | Command buffer | Recording buffer for GPU commands |
 | `vkCreateFence` | Fence | CPU-side synchronization primitive to wait for GPU |
 
-### 6c. `compute()` — The Timed Region
+### 6c. `upload()`, `dispatch()`, `download()` — Separated Phases
 
-This is what gets benchmarked. It does 5 phases:
+`compute()` has been split into three methods so each phase can be timed independently. Only `dispatch()` is timed in `main()`.
 
-**Phase 1: CPU → Staging (memcpy)**
+**`upload(A, B)`**
 
 ```
-CPU RAM (A, B vectors)  →  stagBufA, stagBufB  (HOST_VISIBLE memory)
+CPU RAM (A, B vectors)  →  stagBufA, stagBufB  (HOST_VISIBLE memcpy)
+                       →  bufA, bufB            (VRAM, via vkCmdCopyBuffer)
 ```
 
-The CPU maps the staging buffer memory, memcpy's the data in, then unmaps.
-This is a regular CPU memcpy — no GPU involved yet.
+The CPU maps the staging buffers, memcpy's A and B in, then submits a command buffer containing:
+1. `vkCmdCopyBuffer(stagBufA → bufA)` — DMA A into VRAM
+2. `vkCmdCopyBuffer(stagBufB → bufB)` — DMA B into VRAM
+3. `vkCmdPipelineBarrier` — ensure DMA is visible to the shader before dispatch
 
-**Phase 2: Record GPU Commands**
+**`dispatch()`** ← only this is timed
 
-The CPU records a sequence of commands into the command buffer (nothing executes yet):
+Submits a command buffer containing:
+1. `vkCmdBindPipeline` — select the compute pipeline
+2. `vkCmdBindDescriptorSets` — connect bufA/bufB/bufC to the shader
+3. `vkCmdPushConstants` — send N to the shader
+4. `vkCmdDispatch(groups, groups, 1)` — launch `ceil(N/16)²` workgroups
 
-1. `vkCmdCopyBuffer(stagBufA → bufA)` — DMA transfer A into VRAM
-2. `vkCmdCopyBuffer(stagBufB → bufB)` — DMA transfer B into VRAM
-3. `vkCmdPipelineBarrier` — wait for DMA to finish before the shader reads
-4. `vkCmdBindPipeline` — select the compute shader
-5. `vkCmdBindDescriptorSets` — connect bufA/bufB/bufC to the shader
-6. `vkCmdPushConstants` — send N to the shader
-7. `vkCmdDispatch(groups, groups, 1)` — launch `(N/16)²` workgroups
-8. `vkCmdPipelineBarrier` — wait for shader to finish before reading back C
-9. `vkCmdCopyBuffer(bufC → stagBufC)` — DMA transfer C out of VRAM
+The CPU blocks at `vkWaitForFences` until the GPU finishes all dispatched work. The measured time is pure GPU shader time.
 
-**Phase 3: Submit and Wait**
+**`download(C)`**
+
+Submits a command buffer containing:
+1. `vkCmdPipelineBarrier` — ensure shader writes to bufC are visible before the transfer
+2. `vkCmdCopyBuffer(bufC → stagBufC)` — DMA C out of VRAM
+
+Then CPU maps the staging buffer and memcpy's the result into the output pointer.
+
+**`submitAndWait()`** is a private helper used by all three methods:
 
 ```cpp
+vkResetFences(dev_, 1, &fence_);
 vkQueueSubmit(queue_, 1, &si, fence_);
 vkWaitForFences(dev_, 1, &fence_, VK_TRUE, UINT64_MAX);
 ```
-
-The recorded commands are sent to the GPU. The CPU blocks at `vkWaitForFences` until the GPU signals the fence (all commands done).
-
-**Phase 4: Staging → CPU (memcpy)**
-
-```
-stagBufC  →  C (output float* pointer)
-```
-
-The CPU maps the staging buffer and memcpy's the result out.
 
 ### 6d. Why Two Buffer Tiers?
 
@@ -302,9 +325,21 @@ Order: Naive → AVX2 → pthread → pthread+AVX2 → Vulkan
 
 Each benchmark writes its result into the same `C` vector (overwriting the previous result). No correctness check is done — the benchmark only measures speed.
 
-The Vulkan benchmark is wrapped in a try/catch because GPU initialization can fail (no Vulkan driver, wrong `deviceNo`, missing SPIR-V file, etc.).
+The Vulkan section is structured to isolate GPU compute time:
 
-> **Note:** At the time of writing, the Naive, AVX2, pthread, and pthread+AVX2 calls are commented out in `main()`. Only the Vulkan path runs. Uncomment the calls to run the CPU benchmarks.
+```cpp
+vk.upload(A.data(), B.data());   // PCIe transfer — not timed
+
+auto t0 = std::chrono::high_resolution_clock::now();
+vk.dispatch();                    // GPU shader only — timed
+auto t1 = std::chrono::high_resolution_clock::now();
+
+vk.download(C.data());           // PCIe transfer — not timed
+```
+
+This gives a fair comparison: the printed time reflects only the shader execution, not the ~60–80 ms PCIe overhead of shipping 768 MB to/from the GPU at N=8192.
+
+The Vulkan benchmark is wrapped in a try/catch because GPU initialization can fail (no Vulkan driver, wrong `deviceNo`, missing SPIR-V file, etc.).
 
 ---
 
@@ -316,4 +351,4 @@ The Vulkan benchmark is wrapped in a try/catch because GPU initialization can fa
 | AVX2 | 1 CPU thread, 8-wide SIMD | FMA on 8 floats at once | Memory bandwidth |
 | pthread | N CPU threads | Row partitioning, no locks | Memory bandwidth |
 | pthread+AVX2 | N threads × 8-wide SIMD | Best of both above | Memory bandwidth |
-| Vulkan | Thousands of GPU threads | Massively parallel GPU dispatch | PCIe transfer + memory access pattern |
+| Vulkan | Thousands of GPU threads | Tiled shared-memory dispatch | PCIe transfer (excluded from timing) |

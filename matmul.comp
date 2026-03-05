@@ -1,6 +1,6 @@
 #version 450
-
-layout(local_size_x = 16, local_size_y = 16) in;
+#define TILE 16
+layout(local_size_x = TILE, local_size_y = TILE) in;
 
 layout(set = 0, binding = 0) readonly buffer MatA { float data[]; } A;
 layout(set = 0, binding = 1) readonly buffer MatB { float data[]; } B;
@@ -10,14 +10,36 @@ layout(push_constant) uniform PC {
     uint N;
 } pc;
 
+shared float tileA[TILE][TILE];
+shared float tileB[TILE][TILE];
+
 void main() {
     uint col = gl_GlobalInvocationID.x;
     uint row = gl_GlobalInvocationID.y;
-    if (row >= pc.N || col >= pc.N) return;
+    uint lx  = gl_LocalInvocationID.x;
+    uint ly  = gl_LocalInvocationID.y;
 
     float sum = 0.0;
-    for (uint k = 0; k < pc.N; k++) {
-        sum += A.data[row * pc.N + k] * B.data[k * pc.N + col];
+    uint numTiles = (pc.N + TILE - 1) / TILE;
+
+    for (uint t = 0; t < numTiles; t++) {
+        // Cooperatively load a TILE×TILE block of A and B into shared memory
+        uint aCol = t * TILE + lx;
+        uint bRow = t * TILE + ly;
+
+        tileA[ly][lx] = (row < pc.N && aCol < pc.N) ? A.data[row * pc.N + aCol] : 0.0;
+        tileB[ly][lx] = (bRow < pc.N && col < pc.N) ? B.data[bRow * pc.N + col] : 0.0;
+
+        barrier();
+        memoryBarrierShared();
+
+        for (uint k = 0; k < TILE; k++)
+            sum += tileA[ly][k] * tileB[k][lx];
+
+        barrier();
+        memoryBarrierShared();
     }
-    C.data[row * pc.N + col] = sum;
+
+    if (row < pc.N && col < pc.N)
+        C.data[row * pc.N + col] = sum;
 }

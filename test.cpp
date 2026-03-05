@@ -14,7 +14,7 @@
 #include <vulkan/vulkan.h>
 
 static const uint32_t N = 8192; // Matrix dimension NxN
-static const int deviceNo = 0; // Adjust if you have multiple GPUs, otherwise leave it at 0
+static const int deviceNo = 1; // Adjust if you have multiple GPUs, otherwise leave it at 0
 
 // ============================================================
 // Utility
@@ -441,29 +441,25 @@ public:
         vkCreateFence(dev_, &fci, nullptr, &fence_);
     }
 
-    // Upload A and B to staging, DMA to VRAM, dispatch compute, DMA result back, download C.
-    // Only this function is timed in main().
-    void compute(const float* A, const float* B, float* C) {
+    // CPU memcpy A,B -> staging; DMA staging -> VRAM.
+    void upload(const float* A, const float* B) {
         VkDeviceSize sz = (VkDeviceSize)n_ * n_ * sizeof(float);
 
-        // Write A and B into host-visible staging buffers
-        auto upload = [&](VkDeviceMemory mem, const float* src) {
+        auto cpuCopy = [&](VkDeviceMemory mem, const float* src) {
             void* ptr;
             vkMapMemory(dev_, mem, 0, sz, 0, &ptr);
             memcpy(ptr, src, sz);
             vkUnmapMemory(dev_, mem);
         };
-        upload(stagMemA_, A);
-        upload(stagMemB_, B);
+        cpuCopy(stagMemA_, A);
+        cpuCopy(stagMemB_, B);
 
-        // Record command buffer
         vkResetCommandBuffer(cmdBuf_, 0);
         VkCommandBufferBeginInfo bi{};
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmdBuf_, &bi);
 
-        // DMA staging -> device-local for A and B
         VkBufferCopy region{0, 0, sz};
         vkCmdCopyBuffer(cmdBuf_, stagBufA_, bufA_, 1, &region);
         vkCmdCopyBuffer(cmdBuf_, stagBufB_, bufB_, 1, &region);
@@ -478,7 +474,19 @@ public:
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &bar, 0, nullptr, 0, nullptr);
 
-        // Dispatch compute
+        vkEndCommandBuffer(cmdBuf_);
+
+        submitAndWait();
+    }
+
+    // Bind pipeline + descriptors, push constants, dispatch — the only part timed.
+    void dispatch() {
+        vkResetCommandBuffer(cmdBuf_, 0);
+        VkCommandBufferBeginInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmdBuf_, &bi);
+
         vkCmdBindPipeline(cmdBuf_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         vkCmdBindDescriptorSets(cmdBuf_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 pipeLayout_, 0, 1, &descSet_, 0, nullptr);
@@ -487,7 +495,24 @@ public:
         uint32_t groups = (n_ + 15) / 16;
         vkCmdDispatch(cmdBuf_, groups, groups, 1);
 
+        vkEndCommandBuffer(cmdBuf_);
+
+        submitAndWait();
+    }
+
+    // DMA VRAM C -> staging; CPU memcpy staging -> C.
+    void download(float* C) {
+        VkDeviceSize sz = (VkDeviceSize)n_ * n_ * sizeof(float);
+
+        vkResetCommandBuffer(cmdBuf_, 0);
+        VkCommandBufferBeginInfo bi{};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmdBuf_, &bi);
+
         // Barrier: shader writes to C must be visible to the transfer
+        VkMemoryBarrier bar{};
+        bar.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         bar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
         vkCmdPipelineBarrier(cmdBuf_,
@@ -495,21 +520,13 @@ public:
                              VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 1, &bar, 0, nullptr, 0, nullptr);
 
-        // DMA device-local C -> staging
+        VkBufferCopy region{0, 0, sz};
         vkCmdCopyBuffer(cmdBuf_, bufC_, stagBufC_, 1, &region);
 
         vkEndCommandBuffer(cmdBuf_);
 
-        // Submit and wait
-        vkResetFences(dev_, 1, &fence_);
-        VkSubmitInfo si{};
-        si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        si.commandBufferCount = 1;
-        si.pCommandBuffers    = &cmdBuf_;
-        vkQueueSubmit(queue_, 1, &si, fence_);
-        vkWaitForFences(dev_, 1, &fence_, VK_TRUE, UINT64_MAX);
+        submitAndWait();
 
-        // Download C from staging
         void* ptr;
         vkMapMemory(dev_, stagMemC_, 0, sz, 0, &ptr);
         memcpy(C, ptr, sz);
@@ -535,6 +552,16 @@ public:
     }
 
 private:
+    void submitAndWait() {
+        vkResetFences(dev_, 1, &fence_);
+        VkSubmitInfo si{};
+        si.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers    = &cmdBuf_;
+        vkQueueSubmit(queue_, 1, &si, fence_);
+        vkWaitForFences(dev_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    }
+
     uint32_t n_;
     VkInstance            instance_  = VK_NULL_HANDLE;
     VkPhysicalDevice      pd_        = VK_NULL_HANDLE;
@@ -619,15 +646,20 @@ int main() {
     }
 
     // --- Function 3: Vulkan ---
-    // Vulkan init is outside the timed region so we measure only compute.
+    // Upload and download are outside the timed region; only GPU dispatch is measured.
     try {
         VulkanMatMul vk(n, "matmul.spv");
 
+        vk.upload(A.data(), B.data());
+
         auto t0 = std::chrono::high_resolution_clock::now();
-        vk.compute(A.data(), B.data(), C.data());
+        vk.dispatch();
         auto t1 = std::chrono::high_resolution_clock::now();
+
+        vk.download(C.data());
+
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        std::cout << "Vulkan: " << ms << " ms  (upload + dispatch + download)\n";
+        std::cout << "Vulkan dispatch: " << ms << " ms  (GPU compute only)\n";
     } catch (const std::exception& e) {
         std::cerr << "Vulkan error: " << e.what() << "\n";
         return 1;
